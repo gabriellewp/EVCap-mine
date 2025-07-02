@@ -21,36 +21,48 @@ from common.dist_utils import (
 )
 
 class ConditionalFlow(nn.Module):
-    def __init__(self, dim: int = 768, cond_dim: int = 768, h: int = 1024):
+    def __init__(self, dim: int = 768, cond_dim: int = 768, h: int = 1024, use_attention_mask: bool = False):
         super().__init__()
-        print("Initializing cond flow model with dim:", dim, "cond_dim:", cond_dim, "h:", h)
+        self.use_attention_mask = use_attention_mask
+        
+        # If using attention masks, increase conditioning dimension
+        effective_cond_dim = cond_dim
+        if use_attention_mask:
+            # Could encode the attention mask or simply append it
+            effective_cond_dim = cond_dim + 1  # +1 for attention mask per token
+            
+        print("Initializing cond flow model with dim:", dim, "cond_dim:", effective_cond_dim, "h:", h)
         self.net = nn.Sequential(
-            nn.Linear(dim + cond_dim + 1, h), nn.ELU(),
+            nn.Linear(dim + effective_cond_dim + 1, h), nn.ELU(),
             nn.Linear(h, h), nn.ELU(),
             nn.Linear(h, dim)
-            
         )
     
-    def forward(self, t:torch.Tensor, x_t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, t:torch.Tensor, x_t: torch.Tensor, cond: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         t = t.view(-1, 1)
         if cond is not None:
-            print("cond is not None")
-            inp = torch.cat((x_t, t, cond), dim=-1)
+            if self.use_attention_mask and attn_mask is not None:
+                # Incorporate attention mask into conditioning
+                # For mean-pooled features, we could use a weighted attention value
+                inp = torch.cat((x_t, t, cond, attn_mask), dim=-1)
+            else:
+                inp = torch.cat((x_t, t, cond), dim=-1)
         else:
-            print("cond is None")
             inp = torch.cat((x_t, t), dim=-1)
         return self.net(inp)
 
-    def step(self, x_t: torch.Tensor, t_start: torch.Tensor, t_end: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def step(self, x_t: torch.Tensor, t_start: torch.Tensor, t_end: torch.Tensor, 
+             cond: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Euler-like update: x_t + Δt * f(x_t, t, cond)
-        """
-        #the implementation is similar to the original one, but with lesser accuracy
-    # def step(self, x_t: Tensor, t_start: Tensor, t_end: Tensor) -> Tensor:
-    #     t_start = t_start.view(1, 1).expand(x_t.shape[0], 1)
         
-    #     return x_t + (t_end - t_start) * self(t=t_start + (t_end - t_start) / 2, x_t= x_t + self(x_t=x_t, t=t_start) * (t_end - t_start) / 2)
-
+        Parameters:
+        - x_t: Input features at time t
+        - t_start: Starting time
+        - t_end: Ending time
+        - cond: Conditioning features
+        - attn_mask: Optional attention mask for conditioning
+        """
         if len(t_start.shape) == 1:
             t_start = t_start.view(-1, 1)
         if len(t_end.shape) == 1:
@@ -58,9 +70,13 @@ class ConditionalFlow(nn.Module):
 
         dt = t_end - t_start
         t_mid = t_start + dt / 2
-        velocity_start = self(x_t=x_t, t=t_start, cond=cond)
+        
+        # Forward pass with attention mask if available
+        velocity_start = self(x_t=x_t, t=t_start, cond=cond, attn_mask=attn_mask)
         x_mid = x_t + velocity_start * (dt / 2)
-        velocity_mid = self(x_t=x_mid, t=t_mid, cond=cond)
+        
+        # Midpoint calculation with attention mask if available
+        velocity_mid = self(x_t=x_mid, t=t_mid, cond=cond, attn_mask=attn_mask)
         x_next = x_t + velocity_mid * dt
         return x_next
 
@@ -75,7 +91,7 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def save_checkpoint(model,optimizer, cur_epoch, output_dir):
+def save_checkpoint(model, optimizer, cur_epoch, output_dir, flow_model=None, flow_optimizer=None):
     """
     Save the checkpoint at the current epoch.
     """
@@ -92,6 +108,16 @@ def save_checkpoint(model,optimizer, cur_epoch, output_dir):
         "optimizer": optimizer.state_dict(),
         "epoch": cur_epoch,
     }
+    
+    # Save flow model if provided
+    if flow_model is not None:
+        flow_model_no_ddp = flow_model.module if hasattr(flow_model, "module") else flow_model
+        flow_state_dict = flow_model_no_ddp.state_dict()
+        save_obj["flow_model"] = flow_state_dict
+        
+        if flow_optimizer is not None:
+            save_obj["flow_optimizer"] = flow_optimizer.state_dict()
+    
     print("Saving checkpoint at epoch {} to {}.".format(cur_epoch, output_dir))
     torch.save(save_obj, output_dir)
 
@@ -119,11 +145,11 @@ def train(dataset, model, args):
         sampler = None
         model = model.to(device)
 
-    flow_model = ConditionalFlow(dim=768).to(device)
+    flow_model = ConditionalFlow(dim=768, use_attention_mask=args.use_attention_mask).to(device)
     if args.distributed:
         flow_model = torch.nn.parallel.DistributedDataParallel(flow_model, device_ids=[get_rank()])
     flow_model.train()
-    # flow_optimizer = torch.optim.Adam(flow_model.parameters(), lr=1e-4, weight_decay=0.05)
+    flow_optimizer = torch.optim.Adam(flow_model.parameters(), lr=1e-4, weight_decay=0.05)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True, sampler=sampler,shuffle=False, drop_last=True)
     model.train()
     optimizer = set_optimizer(model, init_lr=1e-4, weight_decay=0.05)
@@ -154,27 +180,42 @@ def train(dataset, model, args):
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         print_freq = 50
         header = 'Train Epoch: [{}]'.format(epoch)
+                
+        projection_x = nn.Linear(5120, 768).to(device).half()
+        projection_cond = nn.Linear(5120, 768).to(device).half()
+        
         for idx, samples in enumerate(metric_logger.log_every(train_dataloader, print_freq, header)):
             samples['image'] = samples['image'].to(device)
-            scheduler.step(cur_epoch=epoch, cur_step=idx)    
-            
-            projection_x = nn.Linear(5120, 768).to(device).half()
-            projection_cond = nn.Linear(5120, 768).to(device).half()
-            
+            scheduler.step(cur_epoch=epoch, cur_step=idx)                
             with torch.no_grad():
-                cond_features, _ = model.module.encode_img(samples['image']) if args.distributed else model.encode_img(samples['image'])
-                cond_features = cond_features.mean(dim=1)
-                #without projection to fit the dimensions
-                # z = cond_features.detach()
-                # eps = torch.randn_like(z)
-                # t = torch.rand(z.size(0), 1).to(z.device)
-                # x_t = z + eps * (1.0 - t)# sample
+                # Get both features and attention masks from encode_img
+                cond_features, attn_masks = model.module.encode_img(samples['image']) if args.distributed else model.encode_img(samples['image'])
                 
-                #with projction to fit dimensions
-                z = projection_cond(cond_features.detach())
-                eps = torch.randn_like(z)
-                t = torch.rand(z.size(0), 1).to(z.device)
-                x_t = z + eps * (1.0 - t)  # Now matches expected dimensions
+                # If using attention masks, process them for conditioning
+                if args.use_attention_mask:
+                    # Option 1: Use attention-weighted mean for features
+                    attn_weights = attn_masks.float()  # Convert to float
+                    # Normalize attention weights
+                    attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-8)
+                    # Compute weighted average of features
+                    cond_features_weighted = (cond_features * attn_weights.unsqueeze(-1)).sum(dim=1)
+                    z_cond = projection_cond(cond_features_weighted.detach())
+                    
+                    # Create attention summary for conditioning (mean attention per sequence)
+                    attn_summary = attn_weights.mean(dim=1, keepdim=True)  # [batch_size, 1]
+                else:
+                    # Standard approach: simple mean pooling
+                    cond_features_mean = cond_features.mean(dim=1)
+                    z_cond = projection_cond(cond_features_mean.detach())
+                    attn_summary = None
+                
+                # Create target features (same as conditioning for now)
+                z_target = z_cond.clone()
+                
+                # Generate noise and timesteps for flow matching
+                eps = torch.randn_like(z_target)
+                t = torch.rand(z_target.size(0), 1).to(z_target.device)
+                x_t = z_target + eps * (1.0 - t)  # Flow matching interpolation
             
 
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -182,8 +223,14 @@ def train(dataset, model, args):
                 model_loss = model_out["loss"]
                 print(f"t shape: {t.shape}")
                 print(f"x_t shape: {x_t.shape}")
-                print(f"z (cond) shape: {z.shape}")
-                pred_eps = flow_model(t=t, x_t=x_t, cond=z)
+                print(f"z_cond shape: {z_cond.shape}")
+                
+                # Call flow model with attention mask if available
+                if args.use_attention_mask and attn_summary is not None:
+                    pred_eps = flow_model(t=t, x_t=x_t, cond=z_cond, attn_mask=attn_summary)
+                else:
+                    pred_eps = flow_model(t=t, x_t=x_t, cond=z_cond)
+                    
                 flow_loss = F.mse_loss(pred_eps, eps)
                 total_loss = model_loss + lambda_flow * flow_loss
                 
@@ -198,17 +245,25 @@ def train(dataset, model, args):
                     scaler.update()                     
                 else:    
                     optimizer.step()
-                    # flow_optimizer.step()
+                    flow_optimizer.step()
                 optimizer.zero_grad()
-                # flow_optimizer.zero_grad()
+                flow_optimizer.zero_grad()
             metric_logger.update(loss=total_loss.item())
             metric_logger.update(lr = optimizer.param_groups[0]["lr"])
+            metric_logger.update(flow_loss=flow_loss.item())  # Add this line
         metric_logger.synchronize_between_processes()
         print("Averaged stats:", metric_logger.global_avg())
  
         if epoch == epochs - 1:
             output_dir_model = os.path.join(output_dir, f"{epoch:03d}.pt")
-            save_checkpoint(model, optimizer, epoch, output_dir_model)
+            save_checkpoint(model, optimizer, epoch, output_dir_model, flow_model, flow_optimizer)
+            
+            # Also save flow model separately for easier loading in sampling script
+            flow_model_path = os.path.join(output_dir, f"flow_model_{epoch:03d}.pt")
+            if get_rank() == 0:  # Only save once in distributed training
+                flow_model_to_save = flow_model.module if hasattr(flow_model, "module") else flow_model
+                torch.save(flow_model_to_save.state_dict(), flow_model_path)
+                print(f"Flow model saved to {flow_model_path}")
     return model
 
 def train_flow_matching_step(flow_model, x0, cond, optimizer):
@@ -242,6 +297,11 @@ def main():
     parser.add_argument('--topn', type = int, default = 9)
     parser.add_argument('--disable_random_seed', action = 'store_true', default = False, help = 'set random seed for reproducing')
     parser.add_argument('--random_seed', type = int, default = 42, help = 'set random seed for reproducing')
+    # Add argument for using attention masks
+    parser.add_argument('--use_attention_mask', action='store_true', default=False, 
+                       help='Use attention masks as additional conditioning in flow model')
+    parser.add_argument('--lambda_flow', type=float, default=1.0, 
+                       help='Weight for flow matching loss')
     args = parser.parse_args()
     print(f'args: {vars(args)}')
     if not args.disable_random_seed:
