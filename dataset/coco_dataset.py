@@ -37,6 +37,7 @@ class COCODataset(Dataset):
             if img_id not in self.img_ids.keys():
                 self.img_ids[img_id] = n
                 n += 1
+        print("Number of annotations", len(self.annotation))
         self.transform = transforms.Compose([
             transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
             transforms.ToTensor(),
