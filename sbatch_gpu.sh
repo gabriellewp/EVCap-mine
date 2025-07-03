@@ -39,8 +39,6 @@ echo "This job is running on $SLURM_JOB_NUM_NODES nodes"
 # export HF_HOME="/ivi/ilps/personal/gpoerwa/.cache/huggingface" \
 # export HF_DATASETS_CACHE="/ivi/ilps/personal/gpoerwa/.cache/huggingface/datasets" \
 # export TRANSFORMERS_CACHE="/ivi/ilps/personal/gpoerwa/.cache/huggingface/models" \
-# export REPLICATE_API_TOKEN="r8_OVbiMFTFdgL07Vzsx876nWU5ObiyHs11iLUZc" \
-export HF_TOKEN="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" \
 # export PYTHONPATH="/ivi/ilps/personal/gpoerwa/MiniGPT-4:$PYTHONPATH" \
 # export TORCH_HOME="/ivi/ilps/personal/gpoerwa/.cache/torch" \
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
