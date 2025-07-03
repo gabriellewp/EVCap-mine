@@ -206,7 +206,6 @@ def validation_nocaps(
     with open(os.path.join(args.out_path, f'outdomain_generated_captions.json'), 'w') as outfile:
         json.dump(outdomain, outfile, indent = 4)
 
-
 @torch.no_grad()
 def main(args) -> None:
     # initializing

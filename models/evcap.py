@@ -141,6 +141,17 @@ class EVCap(Blip2Base):
         print(ext_path)
         with open(ext_path, 'rb') as f:
             ext_base_img, self.ext_base_img_id = pickle.load(f)
+            #the ext_base_img is a tensor of shape [N, 768] and ext_base_img_id is a list of image ids (object names)
+            #the ext_path contains a path to ext_memory_lvis.pkl where the file likely contains:
+            ## ext_base_img: torch.Tensor # Shape: [N, feature_dim] where N is number of objects
+            ## tensor([[0.1, 0.3, -0.2, ...],  # Features for "cat"
+                        # [0.5, -0.1, 0.4, ...],  # Features for "dog" 
+                        # [0.2, 0.8, -0.3, ...],  # Features for "car"
+                        # ...])
+                        
+            ## ext_base_img_id: list # List of object names
+            ## ["cat", "dog", "car", "tree", "person", "bicycle", ...]
+            
             print(ext_base_img.shape, len(self.ext_base_img_id))
             feature_library_cpu = ext_base_img.cpu().numpy()
             faiss.normalize_L2(feature_library_cpu)
